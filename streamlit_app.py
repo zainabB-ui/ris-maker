@@ -1,7 +1,8 @@
 import streamlit as st
 import re
 import json
-import requests
+from curl_cffi import requests as cffi_requests
+from curl_cffi.requests.exceptions import RequestException as CffiRequestException
 
 RIS_TYPE_MAP = {
     "statute": "STAT", "act": "STAT", "law": "STAT",
@@ -367,11 +368,16 @@ def news_fields_from_html(html: str, source_url: str = None) -> dict:
 
 
 def fetch_article_html(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    }
-    resp = requests.get(url, headers=headers, timeout=15)
+    """
+    Fetches the article's HTML using curl_cffi, which replicates a real Chrome
+    browser's TLS/HTTP2 fingerprint (not just the User-Agent header). This gets
+    past ordinary bot-blocking on most news sites that reject plain `requests`
+    calls. It will NOT get past sites that require solving a JavaScript
+    challenge (e.g. Cloudflare Turnstile) or that are paywalled -- those need a
+    real browser and raise a clear error instead of silently failing, so the
+    'Paste a citation' tab remains the fallback.
+    """
+    resp = cffi_requests.get(url, impersonate="chrome", timeout=15)
     resp.raise_for_status()
     return resp.text
 
@@ -404,8 +410,8 @@ with tab1:
 
 with tab2:
     st.write("Paste the URL of a news article (works in any browser — Chrome, Safari, Firefox). "
-             "This reads the same Open Graph and schema.org metadata that BibItNow! reads, so it works on "
-             "most major news sites, without needing a browser extension.")
+             "This reads the same Open Graph and schema.org metadata that BibItNow! reads, using a fetcher "
+             "that mimics a real Chrome browser's network fingerprint so more sites let the request through.")
     url = st.text_input("Article URL:", placeholder="https://www.nytimes.com/2022/08/30/world/asia/pakistan-floods.html")
 
     if url.strip():
@@ -414,9 +420,9 @@ with tab2:
                 html = fetch_article_html(url.strip())
             fields = news_fields_from_html(html, source_url=url.strip())
             if not fields.get("TI"):
-                st.warning("Couldn't find a title on this page. The site may block automated requests, or may not "
-                           "publish standard metadata. Try the 'Paste a citation' tab instead and type the citation "
-                           "in Author. \"Title.\" Publication, Date. format.")
+                st.warning("Couldn't find a title on this page. The site may not publish standard metadata. "
+                           "Try the 'Paste a citation' tab instead and type the citation in "
+                           "Author. \"Title.\" Publication, Date. format.")
             else:
                 st.subheader("Review parsed fields")
                 final_fields = render_review_form(fields, key_prefix="news")
@@ -425,9 +431,12 @@ with tab2:
                 st.code(ris_text, language=None)
                 st.download_button("⬇️ Download .ris file", data=ris_text, file_name="news_article.ris",
                                     mime="application/x-research-info-systems", key="news_download")
-        except requests.exceptions.RequestException as e:
-            st.error(f"Couldn't fetch that page ({e}). Some sites block automated fetching, or the URL may need "
-                     "to be the direct article link (not a homepage or search result).")
+        except CffiRequestException as e:
+            st.error(f"Couldn't fetch that page ({e}). This site may require solving a JavaScript challenge, "
+                     "may be paywalled, or may block automated access outright. Use the 'Paste a citation' tab "
+                     "instead \u2014 type it as: Author. \"Title.\" Publication Name, Month Day, Year.")
+        except Exception as e:
+            st.error(f"Unexpected error fetching that page ({e}). Try the 'Paste a citation' tab instead.")
 
 with tab3:
     st.write("Paste in a whole BibTeX file (e.g. downloaded from AnyStyle.io, Google Scholar's 'Cite' button, or Overleaf).")
@@ -457,4 +466,3 @@ with tab3:
 st.divider()
 st.caption("Built for turning legislation, government reports, news articles, and PDFs into RIS files when "
            "BibItNow! and Google Scholar's export don't work well or aren't available in your browser.")
-
