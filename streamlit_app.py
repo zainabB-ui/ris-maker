@@ -1,5 +1,7 @@
 import streamlit as st
 import re
+import json
+import requests
 
 RIS_TYPE_MAP = {
     "statute": "STAT", "act": "STAT", "law": "STAT",
@@ -29,9 +31,9 @@ FIELD_ORDER = ["AU", "A2", "A3", "TI", "T2", "T3", "PY", "DA", "VL", "IS",
 
 FRIENDLY_LABELS = {
     'TY': 'Type', 'AU': 'Author(s)', 'A2': 'Jurisdiction / secondary author',
-    'TI': 'Title', 'T2': 'Journal / container', 'VL': 'Volume / number',
+    'TI': 'Title', 'T2': 'Journal / publication', 'VL': 'Volume / number',
     'IS': 'Issue', 'SP': 'Start page', 'EP': 'End page', 'PY': 'Year',
-    'PB': 'Publisher', 'CY': 'City', 'UR': 'URL', 'N1': 'Notes',
+    'DA': 'Full date', 'PB': 'Publisher', 'CY': 'City', 'UR': 'URL', 'N1': 'Notes',
 }
 
 
@@ -57,6 +59,40 @@ def build_ris_record(fields: dict) -> str:
     lines.append("ER  - ")
     return "\n".join(lines)
 
+
+def render_review_form(fields: dict, key_prefix: str) -> dict:
+    """Shared editable review UI used by every tab."""
+    ty_names = {v: k for k, v in RIS_TYPE_MAP.items()}
+    kind_options = sorted(set(RIS_TYPE_MAP.keys()))
+    default_kind = ty_names.get(fields.get('TY'), 'report')
+    chosen_kind = st.selectbox("Reference type", kind_options,
+                                index=kind_options.index(default_kind) if default_kind in kind_options else 0,
+                                key=f"{key_prefix}_type")
+    fields = dict(fields)
+    fields['TY'] = RIS_TYPE_MAP[chosen_kind]
+
+    editable_fields = {"TY": fields['TY']}
+    for tag in ["AU", "A2", "TI", "T2", "VL", "IS", "SP", "EP", "PY", "DA", "PB", "CY", "N1"]:
+        current = fields.get(tag)
+        if current is None:
+            continue
+        label = FRIENDLY_LABELS.get(tag, tag)
+        if isinstance(current, list):
+            current = "; ".join(str(c) for c in current if c)
+        new_val = st.text_input(label, value=current or "", key=f"{key_prefix}_{tag}")
+        if new_val:
+            editable_fields[tag] = new_val
+
+    url_val = st.text_input("URL", value=fields.get("UR", ""), key=f"{key_prefix}_UR")
+    if url_val:
+        editable_fields['UR'] = url_val
+
+    return {k: v for k, v in editable_fields.items() if v}
+
+
+# ---------------------------------------------------------------------------
+# Free-text citation parsing
+# ---------------------------------------------------------------------------
 
 def detect_type(text: str) -> str:
     t = text.lower()
@@ -175,6 +211,10 @@ PARSERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# BibTeX -> RIS
+# ---------------------------------------------------------------------------
+
 def clean_braces(val: str) -> str:
     return val.replace('{', '').replace('}', '').strip()
 
@@ -244,61 +284,156 @@ def bibtex_entry_to_ris(entry_type: str, fields: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# News / web article extraction (Open Graph + schema.org JSON-LD)
+# ---------------------------------------------------------------------------
+
+def extract_meta_tags(html: str) -> dict:
+    tags = {}
+    for m in re.finditer(r'<meta\s+([^>]+?)/?>', html, re.I):
+        attrs_str = m.group(1)
+        prop_m = re.search(r'(?:property|name)\s*=\s*["\']([^"\']+)["\']', attrs_str, re.I)
+        content_m = re.search(r'content\s*=\s*["\']([^"\']*)["\']', attrs_str, re.I)
+        if prop_m and content_m:
+            tags[prop_m.group(1).lower()] = content_m.group(1)
+    return tags
+
+
+def extract_json_ld(html: str) -> dict:
+    scripts = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S)
+    wanted_types = ("NewsArticle", "Article", "Report", "BlogPosting")
+    for s in scripts:
+        try:
+            data = json.loads(s.strip())
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("@type") in wanted_types:
+                        return item
+            elif isinstance(data, dict):
+                if data.get("@type") in wanted_types:
+                    return data
+                graph = data.get("@graph")
+                if isinstance(graph, list):
+                    for item in graph:
+                        if isinstance(item, dict) and item.get("@type") in wanted_types:
+                            return item
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            continue
+    return {}
+
+
+def news_fields_from_html(html: str, source_url: str = None) -> dict:
+    meta = extract_meta_tags(html)
+    jsonld = extract_json_ld(html)
+
+    title = jsonld.get("headline") or meta.get("og:title") or meta.get("twitter:title")
+
+    authors = []
+    jsonld_author = jsonld.get("author")
+    if jsonld_author:
+        if isinstance(jsonld_author, list):
+            authors = [a.get("name") for a in jsonld_author if isinstance(a, dict) and a.get("name")]
+        elif isinstance(jsonld_author, dict) and jsonld_author.get("name"):
+            authors = [jsonld_author["name"]]
+    if not authors and meta.get("author"):
+        authors = [meta["author"]]
+
+    date_raw = jsonld.get("datePublished") or meta.get("article:published_time")
+    year, full_date = None, None
+    if date_raw:
+        date_m = re.match(r"(\d{4})-(\d{2})-(\d{2})", date_raw)
+        if date_m:
+            year = date_m.group(1)
+            full_date = f"{date_m.group(1)}/{date_m.group(2)}/{date_m.group(3)}"
+
+    publisher = None
+    jsonld_pub = jsonld.get("publisher")
+    if isinstance(jsonld_pub, dict):
+        publisher = jsonld_pub.get("name")
+    if not publisher:
+        publisher = meta.get("og:site_name")
+
+    url = meta.get("og:url") or source_url
+
+    fields = {
+        "TY": "NEWS",
+        "AU": authors if authors else None,
+        "TI": title,
+        "T2": publisher,
+        "PY": year,
+        "DA": full_date,
+        "UR": url,
+    }
+    return {k: v for k, v in fields.items() if v}
+
+
+def fetch_article_html(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    }
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.text
+
+
+# ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="RIS Maker", page_icon="📚")
 st.title("📚 RIS Maker")
-st.caption("Paste a reference or upload a BibTeX file — get a ready-to-import .ris file for EndNote, Zotero, or Mendeley.")
+st.caption("Paste a reference, a news article URL, or upload a BibTeX file — get a ready-to-import .ris file for EndNote, Zotero, or Mendeley.")
 
-tab1, tab2 = st.tabs(["Paste a citation", "Upload BibTeX (.bib)"])
+tab1, tab2, tab3 = st.tabs(["Paste a citation", "News article URL", "Upload BibTeX (.bib)"])
 
 with tab1:
     st.write("Works best with Chicago/Turabian-style citations, plus common U.S. bill, statute, and case formats.")
     example = "Pakistan Bureau of Statistics. 1998 Census Report of Pakistan. Islamabad: Government of Pakistan, 2001."
-    text = st.text_area("Paste your reference here:", placeholder=example, height=100)
+    text = st.text_area("Paste your reference here:", placeholder=example, height=100, key="paste_text")
 
     if text.strip():
         kind = detect_type(text)
-        parser = PARSERS[kind]
-        fields = parser(text)
-
+        fields = PARSERS[kind](text)
         st.subheader("Review parsed fields")
-        ty_names = {v: k for k, v in RIS_TYPE_MAP.items()}
-        kind_options = sorted(set(RIS_TYPE_MAP.keys()))
-        default_kind = ty_names.get(fields.get('TY'), 'report')
-        chosen_kind = st.selectbox("Reference type", kind_options,
-                                    index=kind_options.index(default_kind) if default_kind in kind_options else 0)
-        fields['TY'] = RIS_TYPE_MAP[chosen_kind]
-
-        editable_fields = {}
-        for tag in ["AU", "A2", "TI", "T2", "VL", "IS", "SP", "EP", "PY", "PB", "CY", "N1"]:
-            current = fields.get(tag)
-            if current is None:
-                continue
-            label = FRIENDLY_LABELS.get(tag, tag)
-            if isinstance(current, list):
-                current = "; ".join(str(c) for c in current if c)
-            new_val = st.text_input(label, value=current or "")
-            if new_val:
-                editable_fields[tag] = new_val
-
-        url_val = st.text_input("URL (optional)", value="")
-        if url_val:
-            editable_fields['UR'] = url_val
-
-        editable_fields['TY'] = fields['TY']
-        editable_fields = {k: v for k, v in editable_fields.items() if v}
-
-        ris_text = build_ris_record(editable_fields)
+        final_fields = render_review_form(fields, key_prefix="paste")
+        ris_text = build_ris_record(final_fields)
         st.subheader("Result")
         st.code(ris_text, language=None)
-        st.download_button("⬇️ Download .ris file", data=ris_text, file_name="reference.ris", mime="application/x-research-info-systems")
+        st.download_button("⬇️ Download .ris file", data=ris_text, file_name="reference.ris",
+                            mime="application/x-research-info-systems", key="paste_download")
 
 with tab2:
+    st.write("Paste the URL of a news article (works in any browser — Chrome, Safari, Firefox). "
+             "This reads the same Open Graph and schema.org metadata that BibItNow! reads, so it works on "
+             "most major news sites, without needing a browser extension.")
+    url = st.text_input("Article URL:", placeholder="https://www.nytimes.com/2022/08/30/world/asia/pakistan-floods.html")
+
+    if url.strip():
+        try:
+            with st.spinner("Fetching article..."):
+                html = fetch_article_html(url.strip())
+            fields = news_fields_from_html(html, source_url=url.strip())
+            if not fields.get("TI"):
+                st.warning("Couldn't find a title on this page. The site may block automated requests, or may not "
+                           "publish standard metadata. Try the 'Paste a citation' tab instead and type the citation "
+                           "in Author. \"Title.\" Publication, Date. format.")
+            else:
+                st.subheader("Review parsed fields")
+                final_fields = render_review_form(fields, key_prefix="news")
+                ris_text = build_ris_record(final_fields)
+                st.subheader("Result")
+                st.code(ris_text, language=None)
+                st.download_button("⬇️ Download .ris file", data=ris_text, file_name="news_article.ris",
+                                    mime="application/x-research-info-systems", key="news_download")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Couldn't fetch that page ({e}). Some sites block automated fetching, or the URL may need "
+                     "to be the direct article link (not a homepage or search result).")
+
+with tab3:
     st.write("Paste in a whole BibTeX file (e.g. downloaded from AnyStyle.io, Google Scholar's 'Cite' button, or Overleaf).")
     bib_text = st.text_area("Paste BibTeX content here:", height=200,
-                             placeholder="@book{anderson1983imagined,\n  author = {Anderson, Benedict},\n  title = {Imagined Communities},\n  publisher = {Verso},\n  address = {London},\n  year = {1983}\n}")
+                             placeholder="@book{anderson1983imagined,\n  author = {Anderson, Benedict},\n  title = {Imagined Communities},\n  publisher = {Verso},\n  address = {London},\n  year = {1983}\n}",
+                             key="bib_text")
     uploaded = st.file_uploader("...or upload a .bib file", type=["bib", "txt"])
 
     if uploaded is not None:
@@ -316,7 +451,10 @@ with tab2:
             st.success(f"Parsed {len(records)} reference(s).")
             full_text = "\n\n".join(records) + "\n\n"
             st.code(full_text, language=None)
-            st.download_button("⬇️ Download .ris file", data=full_text, file_name="references.ris", mime="application/x-research-info-systems")
+            st.download_button("⬇️ Download .ris file", data=full_text, file_name="references.ris",
+                                mime="application/x-research-info-systems", key="bib_download")
 
 st.divider()
-st.caption("Built for turning legislation, government reports, and PDFs into RIS files when BibItNow! and Google Scholar's export don't work well.")
+st.caption("Built for turning legislation, government reports, news articles, and PDFs into RIS files when "
+           "BibItNow! and Google Scholar's export don't work well or aren't available in your browser.")
+
